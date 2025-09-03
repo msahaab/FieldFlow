@@ -1,0 +1,7 @@
+celery
+Django
+djangorestframework
+pytest
+drf-spectacular
+Pillow
+uwsgi
