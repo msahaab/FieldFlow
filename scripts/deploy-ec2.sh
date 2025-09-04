@@ -183,6 +183,19 @@ docker-compose -f "$COMPOSE_FILE" run --rm -w /app app python manage.py migrate 
 log "Collecting static (one-off)..."
 docker-compose -f "$COMPOSE_FILE" run --rm -w /app app python manage.py collectstatic --noinput || warn "collectstatic failed"
 
+log "Restarting app server..."
+docker-compose -f "$COMPOSE_FILE" up -d --no-deps --force-recreate app
+
+log "Ensure server process present (non-fatal)..."
+docker-compose -f "$COMPOSE_FILE" exec -d app sh -lc '
+pgrep -f "gunicorn|daphne|uvicorn|manage.py runserver" >/dev/null && exit 0
+if command -v gunicorn >/dev/null 2>&1; then
+  exec gunicorn config.wsgi:application --bind 0.0.0.0:${PORT:-8000} --workers ${WEB_CONCURRENCY:-2} --timeout ${WEB_TIMEOUT:-60} --log-file -
+else
+  exec python manage.py runserver 0.0.0.0:8000
+fi
+' || true
+
 log "Pruning old images..."
 docker image prune -f || true
 
