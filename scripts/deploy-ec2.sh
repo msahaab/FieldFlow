@@ -56,9 +56,7 @@ PUBIP="$(curl -sS -H "X-aws-ec2-metadata-token: ${TOKEN}" http://169.254.169.254
 
 mkdir -p /opt/fieldflow/db
 if [ ! -f /opt/fieldflow/db/db.sqlite3 ]; then
-  log "Creating empty SQLite DB file at /opt/fieldflow/db/db.sqlite3"
   touch /opt/fieldflow/db/db.sqlite3
-  chmod 664 /opt/fieldflow/db/db.sqlite3 || true
 fi
 
 if [ ! -f "$ENV_FILE" ]; then
@@ -68,7 +66,7 @@ if [ ! -f "$ENV_FILE" ]; then
     cat > "$ENV_FILE" <<EOF
 DJANGO_SECRET_KEY=CHANGE_ME
 DJANGO_DEBUG=0
-DATABASE_URL=sqlite:////app/db.sqlite3
+DATABASE_URL=sqlite:////data/db.sqlite3
 EOF
   fi
   HOSTS="localhost,127.0.0.1,${PUBIP:-your-domain.com}"
@@ -77,7 +75,12 @@ EOF
   else
     echo "DJANGO_ALLOWED_HOSTS=${HOSTS}" >> "$ENV_FILE"
   fi
-  log "Wrote $ENV_FILE (DJANGO_ALLOWED_HOSTS=${HOSTS})"
+else
+  if grep -qE '^DATABASE_URL=' "$ENV_FILE"; then
+    sed -i "s#^DATABASE_URL=.*#DATABASE_URL=sqlite:////data/db.sqlite3#" "$ENV_FILE"
+  else
+    echo "DATABASE_URL=sqlite:////data/db.sqlite3" >> "$ENV_FILE"
+  fi
 fi
 
 log "Writing $COMPOSE_FILE ..."
@@ -92,7 +95,7 @@ services:
       - SECRET_KEY=${DJANGO_SECRET_KEY}
       - DEBUG=0
     volumes:
-      - /opt/fieldflow/db/db.sqlite3:/app/db.sqlite3
+      - /opt/fieldflow/db:/data
       - static-data:/vol/web
       - media-data:/vol/web/media
     networks: [app-network]
@@ -125,7 +128,7 @@ if docker-compose -f "$COMPOSE_FILE" ps 2>/dev/null | grep -q "Up"; then
   cp "$ENV_FILE" "$BACKUP_DIR/$TS/" || true
   CID="$(docker-compose -f "$COMPOSE_FILE" ps -q app || true)"
   if [ -n "$CID" ]; then
-    docker cp "$CID:/app/db.sqlite3" "$BACKUP_DIR/$TS/db.sqlite3" 2>/dev/null || true
+    docker cp "$CID:/data/db.sqlite3" "$BACKUP_DIR/$TS/db.sqlite3" 2>/dev/null || true
   fi
   log "Backup stored at $BACKUP_DIR/$TS"
 fi
@@ -142,9 +145,9 @@ docker-compose -f "$COMPOSE_FILE" up -d --remove-orphans app proxy
 log "Ensuring SQLite ownership and perms..."
 APP_UID="$(docker run --rm "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" sh -c 'id -u' 2>/dev/null || echo 1000)"
 APP_GID="$(docker run --rm "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" sh -c 'id -g' 2>/dev/null || echo 1000)"
-sudo chown "${APP_UID}:${APP_GID}" /opt/fieldflow/db /opt/fieldflow/db/db.sqlite3 || true
-sudo chmod 775 /opt/fieldflow/db || true
-sudo chmod 664 /opt/fieldflow/db/db.sqlite3 || true
+sudo chown -R "${APP_UID}:${APP_GID}" /opt/fieldflow/db || true
+sudo find /opt/fieldflow/db -type d -exec chmod 775 {} \; || true
+sudo find /opt/fieldflow/db -type f -exec chmod 664 {} \; || true
 
 log "Waiting 20s for services..."
 sleep 20
@@ -173,7 +176,7 @@ rollback() {
   docker-compose -f "$COMPOSE_FILE" up -d
   if [ -f "$BACKUP_DIR/$LATEST/db.sqlite3" ]; then
     CID="$(docker-compose -f "$COMPOSE_FILE" ps -q app)"
-    docker cp "$BACKUP_DIR/$LATEST/db.sqlite3" "$CID:/app/db.sqlite3" || true
+    docker cp "$BACKUP_DIR/$LATEST/db.sqlite3" "$CID:/data/db.sqlite3" || true
   fi
   log "Rollback done."
 }
