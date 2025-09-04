@@ -10,20 +10,20 @@ on:
         required: true
         default: 'production'
         type: choice
-        options:
-          - production
-          - staging
+        options: [production, staging]
 
 env:
   AWS_REGION: us-east-1
   ECR_REPOSITORY: fieldflow-app
-  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
   test:
     name: Test and Lint
     runs-on: ubuntu-latest
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -31,89 +31,71 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USER }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Run tests (compose)
+        run: docker compose run --rm app sh -c "python manage.py test"
 
-      - name: Run tests
-        run: |
-          docker compose run --rm app sh -c "python manage.py test"
-
-      - name: Lint
-        run: |
-          docker compose run --rm app sh -c "flake8"
+      - name: Lint (compose)
+        run: docker compose run --rm app sh -c "flake8"
 
   build-and-push:
     name: Build and Push to ECR
     runs-on: ubuntu-latest
     needs: test
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push app image to Amazon ECR
-        id: build-app-image
+      - name: Build, tag, and push APP image to ECR
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          # Build and push app image
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG .
+          docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest .
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
 
-      - name: Build, tag, and push proxy image to Amazon ECR
-        id: build-proxy-image
+      - name: Build, tag, and push PROXY image to ECR
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          # Build and push proxy image
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY-proxy:$IMAGE_TAG ./proxy
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY-proxy:latest ./proxy
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY-proxy:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY-proxy:latest
-          echo "proxy_image=$ECR_REGISTRY/$ECR_REPOSITORY-proxy:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}-proxy:$IMAGE_TAG ./proxy
+          docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}-proxy:latest ./proxy
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}-proxy:$IMAGE_TAG
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}-proxy:latest
 
   deploy:
     name: Deploy to EC2
     runs-on: ubuntu-latest
     needs: build-and-push
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::<ACCOUNT_ID>:role/<ROLE_NAME>
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to Amazon ECR
+      - name: Login to Amazon ECR (for registry output)
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Deploy to EC2
+      - name: Deploy to EC2 via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
@@ -121,21 +103,25 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           port: ${{ secrets.EC2_PORT || 22 }}
           script: |
-            # Set environment variables
+            set -e
+
+            # Pass env to the remote session
+            export AWS_REGION=${{ env.AWS_REGION }}
             export ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
             export ECR_REPOSITORY=${{ env.ECR_REPOSITORY }}
             export IMAGE_TAG=${{ github.sha }}
             export ENVIRONMENT=${{ github.event.inputs.environment || 'production' }}
-            
-            # Create deployment directory if it doesn't exist
+
+            # Prepare deploy dir
             mkdir -p /opt/fieldflow
-            
-            # Download deployment script
-            curl -o /opt/fieldflow/deploy.sh https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/scripts/deploy-ec2.sh
-            chmod +x /opt/fieldflow/deploy.sh
-            
-            # Run deployment
-            /opt/fieldflow/deploy.sh
+
+            # Fetch deploy script from this repo/branch
+            curl -fsSL -o /opt/fieldflow/deploy-ec2.sh \
+              https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/scripts/deploy-ec2.sh
+            chmod +x /opt/fieldflow/deploy-ec2.sh
+
+            # Run deployment (your script handles ECR login, compose up, migrations, etc.)
+            /opt/fieldflow/deploy-ec2.sh
 
       - name: Health Check
         uses: appleboy/ssh-action@v1.0.3
@@ -145,10 +131,7 @@ jobs:
           key: ${{ secrets.EC2_SSH_KEY }}
           port: ${{ secrets.EC2_PORT || 22 }}
           script: |
-            # Wait for services to be ready
             sleep 30
-            
-            # Health check
             if curl -f http://localhost/health/ || curl -f http://localhost:8000/health/; then
               echo "Deployment successful - Health check passed"
             else
@@ -161,18 +144,15 @@ jobs:
     runs-on: ubuntu-latest
     needs: [deploy]
     if: always()
-    
     steps:
       - name: Notify Success
         if: needs.deploy.result == 'success'
         run: |
           echo "Deployment to AWS EC2 completed successfully!"
           echo "Application is now live at: http://${{ secrets.EC2_HOST }}"
-      
+
       - name: Notify Failure
         if: needs.deploy.result == 'failure'
         run: |
           echo "Deployment to AWS EC2 failed!"
           echo "Please check the logs and try again."
-
-
