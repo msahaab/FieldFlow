@@ -104,7 +104,7 @@ jobs:
           umask 077
           echo "${{ secrets.EC2_SSH_KEY_B64 }}" | base64 -d > key.pem
           sed -i 's/\r$//' key.pem
-          chmod 600 key.pem
+          chmod 644 key.pem
 
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.0.3
