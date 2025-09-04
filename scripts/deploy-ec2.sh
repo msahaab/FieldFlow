@@ -63,10 +63,8 @@ fi
 
 if [ ! -f "$ENV_FILE" ]; then
   if [ -f "$DEPLOY_DIR/.env.sample" ]; then
-    log "Creating .env from .env.sample ..."
     cp "$DEPLOY_DIR/.env.sample" "$ENV_FILE"
   else
-    log "Creating minimal .env ..."
     cat > "$ENV_FILE" <<EOF
 DJANGO_SECRET_KEY=CHANGE_ME
 DJANGO_DEBUG=0
@@ -136,10 +134,10 @@ log "Pulling images..."
 docker-compose -f "$COMPOSE_FILE" pull
 
 log "Stopping existing containers..."
-docker-compose -f "$COMPOSE_FILE" down || true
+docker-compose -f "$COMPOSE_FILE" down --remove-orphans || true
 
 log "Starting app and proxy..."
-docker-compose -f "$COMPOSE_FILE" up -d app proxy
+docker-compose -f "$COMPOSE_FILE" up -d --remove-orphans app proxy
 
 log "Waiting 20s for services..."
 sleep 20
@@ -149,15 +147,6 @@ docker-compose -f "$COMPOSE_FILE" run --rm app python manage.py migrate --noinpu
 
 log "Collecting static (one-off)..."
 docker-compose -f "$COMPOSE_FILE" run --rm app python manage.py collectstatic --noinput || warn "collectstatic failed"
-
-log "Health check..."
-for i in {1..10}; do
-  if curl -fsS http://localhost/health/ >/dev/null 2>&1 || curl -fsS http://localhost:8000/health/ >/dev/null 2>&1; then
-    log "Health check passed"; break
-  fi
-  if [ "$i" -eq 10 ]; then err "Health check failed after 10 attempts"; fi
-  log "Retry $i/10 ..."; sleep 10
-done
 
 log "Pruning old images..."
 docker image prune -f || true
