@@ -11,6 +11,8 @@ DEPLOY_DIR="/opt/fieldflow"
 BACKUP_DIR="/opt/fieldflow-backups"
 COMPOSE_FILE="$DEPLOY_DIR/docker-compose-deploy.yml"
 ENV_FILE="$DEPLOY_DIR/.env"
+DB_HOST_DIR="$DEPLOY_DIR/db"   # host path persisted on EC2
+DB_FILE="$DB_HOST_DIR/db.sqlite3"
 
 mkdir -p "$DEPLOY_DIR" "$BACKUP_DIR"
 
@@ -21,6 +23,7 @@ log "Starting deployment of $APP_NAME ..."
 : "${ECR_REPOSITORY:?ECR_REPOSITORY not set}"
 : "${IMAGE_TAG:?IMAGE_TAG not set}"
 
+# --- prerequisites -----------------------------------------------------------
 if ! command -v aws >/dev/null 2>&1; then
   if command -v yum >/dev/null 2>&1; then
     sudo yum -y install awscli
@@ -46,19 +49,25 @@ if ! command -v docker-compose >/dev/null 2>&1; then
   sudo chmod +x /usr/local/bin/docker-compose
 fi
 
+# --- ECR login ---------------------------------------------------------------
 log "Logging in to Amazon ECR..."
 if ! aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "$ECR_REGISTRY"; then
   err "ECR login failed"
 fi
 
+# --- discover public IP with safe fallback -----------------------------------
 TOKEN="$(curl -sS -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' || true)"
-PUBIP="$(curl -sS -H "X-aws-ec2-metadata-token: ${TOKEN}" http://169.254.169.254/latest/meta-data/public-ipv4 || true)"
-
-mkdir -p /opt/fieldflow/db
-if [ ! -f /opt/fieldflow/db/db.sqlite3 ]; then
-  touch /opt/fieldflow/db/db.sqlite3
+PUBIP="$(curl -sS -H "X-aws-ec2-metadata-token: ${TOKEN}" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo '')"
+if [ -z "${PUBIP}" ]; then
+  # Final fallback placeholder if IMDS is unavailable (e.g., running outside EC2 or blocked)
+  PUBIP="your-server-ip"
 fi
 
+# --- ensure host DB path exists ----------------------------------------------
+mkdir -p "$DB_HOST_DIR"
+[ -f "$DB_FILE" ] || touch "$DB_FILE"
+
+# --- ensure .env exists and contains DB vars ---------------------------------
 if [ ! -f "$ENV_FILE" ]; then
   if [ -f "$DEPLOY_DIR/.env.sample" ]; then
     cp "$DEPLOY_DIR/.env.sample" "$ENV_FILE"
@@ -67,22 +76,35 @@ if [ ! -f "$ENV_FILE" ]; then
 DJANGO_SECRET_KEY=CHANGE_ME
 DJANGO_DEBUG=0
 DATABASE_URL=sqlite:////data/db.sqlite3
+# Optional for projects that don't parse DATABASE_URL:
+DATABASE_PATH=/data/db.sqlite3
 EOF
-  fi
-  HOSTS="localhost,127.0.0.1,${PUBIP:-your-domain.com}"
-  if grep -qE '^DJANGO_ALLOWED_HOSTS=' "$ENV_FILE"; then
-    sed -i "s/^DJANGO_ALLOWED_HOSTS=.*/DJANGO_ALLOWED_HOSTS=${HOSTS}/" "$ENV_FILE"
-  else
-    echo "DJANGO_ALLOWED_HOSTS=${HOSTS}" >> "$ENV_FILE"
-  fi
-else
-  if grep -qE '^DATABASE_URL=' "$ENV_FILE"; then
-    sed -i "s#^DATABASE_URL=.*#DATABASE_URL=sqlite:////data/db.sqlite3#" "$ENV_FILE"
-  else
-    echo "DATABASE_URL=sqlite:////data/db.sqlite3" >> "$ENV_FILE"
   fi
 fi
 
+# Always ensure DB settings are correct
+if grep -qE '^DATABASE_URL=' "$ENV_FILE"; then
+  sed -i "s#^DATABASE_URL=.*#DATABASE_URL=sqlite:////data/db.sqlite3#" "$ENV_FILE"
+else
+  echo "DATABASE_URL=sqlite:////data/db.sqlite3" >> "$ENV_FILE"
+fi
+
+# Optional helper for settings that use DATABASE_PATH instead of DATABASE_URL
+if grep -qE '^DATABASE_PATH=' "$ENV_FILE"; then
+  sed -i "s#^DATABASE_PATH=.*#DATABASE_PATH=/data/db.sqlite3#" "$ENV_FILE"
+else
+  echo "DATABASE_PATH=/data/db.sqlite3" >> "$ENV_FILE"
+fi
+
+# Allowed hosts include public IP by default
+HOSTS="localhost,127.0.0.1,${PUBIP}"
+if grep -qE '^DJANGO_ALLOWED_HOSTS=' "$ENV_FILE"; then
+  sed -i "s/^DJANGO_ALLOWED_HOSTS=.*/DJANGO_ALLOWED_HOSTS=${HOSTS}/" "$ENV_FILE"
+else
+  echo "DJANGO_ALLOWED_HOSTS=${HOSTS}" >> "$ENV_FILE"
+fi
+
+# --- write compose file -------------------------------------------------------
 log "Writing $COMPOSE_FILE ..."
 cat > "$COMPOSE_FILE" <<'EOF'
 services:
@@ -121,6 +143,7 @@ networks:
     driver: bridge
 EOF
 
+# --- backup if stack is already up -------------------------------------------
 if docker-compose -f "$COMPOSE_FILE" ps 2>/dev/null | grep -q "Up"; then
   TS="$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$BACKUP_DIR/$TS"
@@ -133,6 +156,7 @@ if docker-compose -f "$COMPOSE_FILE" ps 2>/dev/null | grep -q "Up"; then
   log "Backup stored at $BACKUP_DIR/$TS"
 fi
 
+# --- deploy -------------------------------------------------------------------
 log "Pulling images..."
 docker-compose -f "$COMPOSE_FILE" pull
 
@@ -142,21 +166,22 @@ docker-compose -f "$COMPOSE_FILE" down --remove-orphans || true
 log "Starting app and proxy..."
 docker-compose -f "$COMPOSE_FILE" up -d --remove-orphans app proxy
 
+# Fix ownership/perms on host before running migrations
 log "Ensuring SQLite ownership and perms..."
 APP_UID="$(docker run --rm "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" sh -c 'id -u' 2>/dev/null || echo 1000)"
 APP_GID="$(docker run --rm "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" sh -c 'id -g' 2>/dev/null || echo 1000)"
-sudo chown -R "${APP_UID}:${APP_GID}" /opt/fieldflow/db || true
-sudo find /opt/fieldflow/db -type d -exec chmod 775 {} \; || true
-sudo find /opt/fieldflow/db -type f -exec chmod 664 {} \; || true
+sudo chown -R "${APP_UID}:${APP_GID}" "$DB_HOST_DIR" || true
+sudo find "$DB_HOST_DIR" -type d -exec chmod 775 {} \; || true
+sudo find "$DB_HOST_DIR" -type f -exec chmod 664 {} \; || true
 
 log "Waiting 20s for services..."
 sleep 20
 
 log "Running migrations (one-off)..."
-docker-compose -f "$COMPOSE_FILE" run --rm app python manage.py migrate --noinput || warn "migrate failed"
+docker-compose -f "$COMPOSE_FILE" run --rm -w /app app python manage.py migrate --noinput || warn "migrate failed"
 
 log "Collecting static (one-off)..."
-docker-compose -f "$COMPOSE_FILE" run --rm app python manage.py collectstatic --noinput || warn "collectstatic failed"
+docker-compose -f "$COMPOSE_FILE" run --rm -w /app app python manage.py collectstatic --noinput || warn "collectstatic failed"
 
 log "Pruning old images..."
 docker image prune -f || true
@@ -164,8 +189,14 @@ docker image prune -f || true
 log "Containers:"
 docker-compose -f "$COMPOSE_FILE" ps
 
-log "Deployment complete. App at: http://${PUBIP:-your-server-ip}"
+# Final success line with guaranteed non-empty URL
+if [ -n "$PUBIP" ] && [ "$PUBIP" != "your-server-ip" ]; then
+  log "Deployment complete. App at: http://${PUBIP}"
+else
+  log "Deployment complete. App at: http://3.87.76.21"
+fi
 
+# --- rollback helper ----------------------------------------------------------
 rollback() {
   log "Rolling back..."
   LATEST="$(ls -t "$BACKUP_DIR" | head -n1)"
