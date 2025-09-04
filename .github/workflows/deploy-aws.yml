@@ -95,9 +95,15 @@ jobs:
       - name: Who am I
         run: aws sts get-caller-identity
 
-      - name: Login to Amazon ECR
+      - name: Login to Amazon ECR (for registry output)
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Export deployment env vars
+        run: |
+          echo "ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${{ github.sha }}" >> "$GITHUB_ENV"
+          echo "ENVIRONMENT=${{ github.event.inputs.environment || 'production' }}" >> "$GITHUB_ENV"
 
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.0.3
@@ -110,19 +116,12 @@ jobs:
           envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN,AWS_REGION,ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ENVIRONMENT
           script: |
             set -e
-            # Use values passed via envs:
-            export AWS_REGION="${AWS_REGION}"
-            export ECR_REGISTRY="${ECR_REGISTRY}"
-            export ECR_REPOSITORY="${ECR_REPOSITORY}"
-            export IMAGE_TAG="${IMAGE_TAG}"
-            export ENVIRONMENT="${ENVIRONMENT:-${{ github.event.inputs.environment || 'production' }}}"
-
+            # Values are now set via envs from the runner:
             mkdir -p /opt/fieldflow
-            # Pin to the current commit SHA for reproducibility
+            # Pin to current commit SHA for reproducibility
             curl -fsSL -o /opt/fieldflow/deploy-ec2.sh \
               https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/scripts/deploy-ec2.sh
             chmod +x /opt/fieldflow/deploy-ec2.sh
-
             /opt/fieldflow/deploy-ec2.sh
 
       - name: Health Check
