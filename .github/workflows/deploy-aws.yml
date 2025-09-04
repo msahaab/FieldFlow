@@ -79,6 +79,10 @@ jobs:
     name: Deploy to EC2
     runs-on: ubuntu-latest
     needs: build-and-push
+    environment: deployment
+    permissions:
+      id-token: write
+      content: read
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
@@ -89,7 +93,7 @@ jobs:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region:            ${{ env.AWS_REGION }}
+          aws-region:            us-east-1
 
       - name: Who am I
         run: aws sts get-caller-identity
@@ -100,29 +104,19 @@ jobs:
 
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.0.3
-        env:
-          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_SESSION_TOKEN:     ${{ secrets.AWS_SESSION_TOKEN }}
-          AWS_REGION:            ${{ env.AWS_REGION }}
-          AWS_DEFAULT_REGION:    ${{ env.AWS_REGION }}
-          ECR_REGISTRY:          ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY:        ${{ env.ECR_REPOSITORY }}
-          IMAGE_TAG:             ${{ github.sha }}
-          ENVIRONMENT:           ${{ github.event.inputs.environment || 'production' }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           port: ${{ secrets.EC2_PORT || '22' }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN,AWS_REGION,AWS_DEFAULT_REGION,ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ENVIRONMENT
           script_stop: true
           script: |
-            set -euo pipefail
-            echo "[Deploy] Login to ECR on EC2"
-            aws ecr get-login-password --region "$AWS_REGION" \
-            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
-
+            set -e
+            export AWS_REGION=${{ env.AWS_REGION }}
+            export ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+            export ECR_REPOSITORY=${{ env.ECR_REPOSITORY }}
+            export IMAGE_TAG=${{ github.sha }}
+            export ENVIRONMENT=${{ github.event.inputs.environment || 'production' }}
             mkdir -p /opt/fieldflow
             curl -fsSL -o /opt/fieldflow/deploy-ec2.sh \
               https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/scripts/deploy-ec2.sh
@@ -131,14 +125,11 @@ jobs:
 
       - name: Health Check
         uses: appleboy/ssh-action@v1.0.3
-        env:
-          AWS_REGION: ${{ env.AWS_REGION }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           port: ${{ secrets.EC2_PORT || '22' }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: AWS_REGION
           script_stop: true
           script: |
             sleep 30
@@ -148,7 +139,6 @@ jobs:
               echo "Deployment failed - Health check failed"
               exit 1
             fi
-
 
   notify:
     name: Notify Deployment Status
@@ -165,4 +155,4 @@ jobs:
         if: needs.deploy.result == 'failure'
         run: |
           echo "Deployment to AWS EC2 failed!"
-          echo "Please check the logs and try again." 
+          echo "Please check the logs and try again."
