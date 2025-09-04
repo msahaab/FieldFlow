@@ -139,6 +139,13 @@ docker-compose -f "$COMPOSE_FILE" down --remove-orphans || true
 log "Starting app and proxy..."
 docker-compose -f "$COMPOSE_FILE" up -d --remove-orphans app proxy
 
+log "Ensuring SQLite ownership and perms..."
+APP_UID="$(docker run --rm "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" sh -c 'id -u' 2>/dev/null || echo 1000)"
+APP_GID="$(docker run --rm "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" sh -c 'id -g' 2>/dev/null || echo 1000)"
+sudo chown "${APP_UID}:${APP_GID}" /opt/fieldflow/db /opt/fieldflow/db/db.sqlite3 || true
+sudo chmod 775 /opt/fieldflow/db || true
+sudo chmod 664 /opt/fieldflow/db/db.sqlite3 || true
+
 log "Waiting 20s for services..."
 sleep 20
 
