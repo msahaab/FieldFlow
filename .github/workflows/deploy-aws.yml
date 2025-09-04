@@ -106,14 +106,20 @@ jobs:
           username: ${{ secrets.EC2_USERNAME }}
           port: ${{ secrets.EC2_PORT || '22' }}
           key: ${{ secrets.EC2_SSH_KEY }}
+          envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN,AWS_REGION,ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ENVIRONMENT
           script_stop: true
           script: |
-            set -e
-            export AWS_REGION=${{ env.AWS_REGION }}
-            export ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
-            export ECR_REPOSITORY=${{ env.ECR_REPOSITORY }}
-            export IMAGE_TAG=${{ github.sha }}
-            export ENVIRONMENT=${{ github.event.inputs.environment || 'production' }}
+            set -euo pipefail
+            export AWS_REGION="${AWS_REGION}"
+            export ECR_REGISTRY="${ECR_REGISTRY}"
+            export ECR_REPOSITORY="${ECR_REPOSITORY}"
+            export IMAGE_TAG="${IMAGE_TAG}"
+            export ENVIRONMENT="${ENVIRONMENT}"
+
+            echo "[Deploy] Login to ECR on EC2"
+            aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
             mkdir -p /opt/fieldflow
             curl -fsSL -o /opt/fieldflow/deploy-ec2.sh \
               https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/scripts/deploy-ec2.sh
@@ -127,6 +133,7 @@ jobs:
           username: ${{ secrets.EC2_USERNAME }}
           port: ${{ secrets.EC2_PORT || '22' }}
           key: ${{ secrets.EC2_SSH_KEY }}
+          envs: AWS_REGION
           script_stop: true
           script: |
             sleep 30
