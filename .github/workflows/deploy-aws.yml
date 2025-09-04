@@ -100,18 +100,22 @@ jobs:
 
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.0.3
-        env:                                
-          AWS_REGION:        ${{ env.AWS_REGION }}
-          ECR_REGISTRY:      ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY:    ${{ env.ECR_REPOSITORY }}
-          IMAGE_TAG:         ${{ github.sha }}
-          ENVIRONMENT:       ${{ github.event.inputs.environment || 'production' }}
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN:     ${{ secrets.AWS_SESSION_TOKEN }}
+          AWS_REGION:            ${{ env.AWS_REGION }}
+          AWS_DEFAULT_REGION:    ${{ env.AWS_REGION }}
+          ECR_REGISTRY:          ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY:        ${{ env.ECR_REPOSITORY }}
+          IMAGE_TAG:             ${{ github.sha }}
+          ENVIRONMENT:           ${{ github.event.inputs.environment || 'production' }}
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           port: ${{ secrets.EC2_PORT || '22' }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN,AWS_REGION,ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ENVIRONMENT
+          envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN,AWS_REGION,AWS_DEFAULT_REGION,ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ENVIRONMENT
           script_stop: true
           script: |
             set -euo pipefail
