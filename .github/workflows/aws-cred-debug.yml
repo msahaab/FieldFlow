@@ -1,0 +1,40 @@
+name: AWS Creds Debug
+on: workflow_dispatch
+
+jobs:
+  with_token:
+    name: With session token
+    runs-on: ubuntu-latest
+    environment: deployment
+    steps:
+      - name: Check secrets present
+        run: |
+          [ -n "${{ secrets.AWS_ACCESS_KEY_ID }}" ] || (echo "Missing AWS_ACCESS_KEY_ID" && exit 1)
+          [ -n "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ] || (echo "Missing AWS_SECRET_ACCESS_KEY" && exit 1)
+          [ -n "${{ secrets.AWS_SESSION_TOKEN }}" ] || (echo "Missing AWS_SESSION_TOKEN" && exit 1)
+
+      - name: Configure AWS (temporary creds)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+
+      - name: Who am I
+        run: aws sts get-caller-identity
+
+  no_token:
+    name: Without session token (should fail for ASIA keys)
+    runs-on: ubuntu-latest
+    environment: deployment
+    steps:
+      - name: Configure AWS (no token)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Who am I (expected to fail for ASIA keys)
+        run: aws sts get-caller-identity
