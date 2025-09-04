@@ -21,9 +21,7 @@ log "Starting deployment of $APP_NAME ..."
 : "${ECR_REPOSITORY:?ECR_REPOSITORY not set}"
 : "${IMAGE_TAG:?IMAGE_TAG not set}"
 
-# --- Dependencies -------------------------------------------------------------
 if ! command -v aws >/dev/null 2>&1; then
-  log "Installing AWS CLI..."
   if command -v yum >/dev/null 2>&1; then
     sudo yum -y install awscli
   elif command -v apt-get >/dev/null 2>&1; then
@@ -35,7 +33,6 @@ if ! command -v aws >/dev/null 2>&1; then
 fi
 
 if ! command -v docker >/dev/null 2>&1; then
-  log "Installing Docker..."
   curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
   sh /tmp/get-docker.sh
   sudo usermod -aG docker "${SUDO_USER:-ec2-user}" || true
@@ -43,45 +40,48 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 if ! command -v docker-compose >/dev/null 2>&1; then
-  log "Installing docker-compose standalone..."
   sudo curl -fsSL \
     "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" \
     -o /usr/local/bin/docker-compose
   sudo chmod +x /usr/local/bin/docker-compose
 fi
 
-# --- ECR Login ---------------------------------------------------------------
 log "Logging in to Amazon ECR..."
-if ! aws ecr get-login-password --region "${AWS_REGION}" \
-  | docker login --username AWS --password-stdin "$ECR_REGISTRY"; then
-  err "ECR login failed. Check AWS credentials/role and network egress."
+if ! aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "$ECR_REGISTRY"; then
+  err "ECR login failed"
 fi
 
-# --- Metadata (IMDSv2) -------------------------------------------------------
 TOKEN="$(curl -sS -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' || true)"
 PUBIP="$(curl -sS -H "X-aws-ec2-metadata-token: ${TOKEN}" http://169.254.169.254/latest/meta-data/public-ipv4 || true)"
 
-# --- .env (SQLite) -----------------------------------------------------------
-if [ ! -f "$ENV_FILE" ]; then
-  log "Creating initial $ENV_FILE ..."
-  cat > "$ENV_FILE" <<EOF
-DJANGO_SECRET_KEY=CHANGE_ME
-DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1,${PUBIP:-your-domain.com}
-
-# SQLite lives on a volume at /data/db.sqlite3
-DATABASE_URL=sqlite:////data/db.sqlite3
-
-# Optional: if your settings read these instead of DATABASE_URL, keep for compatibility
-DJANGO_SQLITE_PATH=/data/db.sqlite3
-
-AWS_REGION=${AWS_REGION}
-ECR_REGISTRY=${ECR_REGISTRY}
-ECR_REPOSITORY=${ECR_REPOSITORY}
-EOF
-  warn "Update $ENV_FILE with real secrets after this run."
+mkdir -p /opt/fieldflow/db
+if [ ! -f /opt/fieldflow/db/db.sqlite3 ]; then
+  log "Creating empty SQLite DB file at /opt/fieldflow/db/db.sqlite3"
+  touch /opt/fieldflow/db/db.sqlite3
+  chmod 664 /opt/fieldflow/db/db.sqlite3 || true
 fi
 
-# --- Compose (app + proxy only) ----------------------------------------------
+if [ ! -f "$ENV_FILE" ]; then
+  if [ -f "$DEPLOY_DIR/.env.sample" ]; then
+    log "Creating .env from .env.sample ..."
+    cp "$DEPLOY_DIR/.env.sample" "$ENV_FILE"
+  else
+    log "Creating minimal .env ..."
+    cat > "$ENV_FILE" <<EOF
+DJANGO_SECRET_KEY=CHANGE_ME
+DJANGO_DEBUG=0
+DATABASE_URL=sqlite:////app/db.sqlite3
+EOF
+  fi
+  HOSTS="localhost,127.0.0.1,${PUBIP:-your-domain.com}"
+  if grep -qE '^DJANGO_ALLOWED_HOSTS=' "$ENV_FILE"; then
+    sed -i "s/^DJANGO_ALLOWED_HOSTS=.*/DJANGO_ALLOWED_HOSTS=${HOSTS}/" "$ENV_FILE"
+  else
+    echo "DJANGO_ALLOWED_HOSTS=${HOSTS}" >> "$ENV_FILE"
+  fi
+  log "Wrote $ENV_FILE (DJANGO_ALLOWED_HOSTS=${HOSTS})"
+fi
+
 log "Writing $COMPOSE_FILE ..."
 cat > "$COMPOSE_FILE" <<'EOF'
 services:
@@ -89,13 +89,12 @@ services:
     image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
     restart: always
     env_file:
-      - ${ENV_FILE}
+      - /opt/fieldflow/.env
     environment:
       - SECRET_KEY=${DJANGO_SECRET_KEY}
       - DEBUG=0
-    # Persist SQLite DB and media/static between deploys
     volumes:
-      - sqlite-data:/data
+      - /opt/fieldflow/db/db.sqlite3:/app/db.sqlite3
       - static-data:/vol/web
       - media-data:/vol/web/media
     networks: [app-network]
@@ -113,7 +112,6 @@ services:
     networks: [app-network]
 
 volumes:
-  sqlite-data:
   static-data:
   media-data:
 
@@ -122,23 +120,18 @@ networks:
     driver: bridge
 EOF
 
-# --- Backup current stack (sqlite + compose/env) -----------------------------
 if docker-compose -f "$COMPOSE_FILE" ps 2>/dev/null | grep -q "Up"; then
-  log "Backing up current deployment..."
   TS="$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$BACKUP_DIR/$TS"
-  # Copy compose and env
   cp "$COMPOSE_FILE" "$BACKUP_DIR/$TS/" || true
   cp "$ENV_FILE" "$BACKUP_DIR/$TS/" || true
-  # Attempt to copy sqlite file from volume (if present)
   CID="$(docker-compose -f "$COMPOSE_FILE" ps -q app || true)"
   if [ -n "$CID" ]; then
-    docker cp "$CID:/data/db.sqlite3" "$BACKUP_DIR/$TS/db.sqlite3" 2>/dev/null || true
+    docker cp "$CID:/app/db.sqlite3" "$BACKUP_DIR/$TS/db.sqlite3" 2>/dev/null || true
   fi
   log "Backup stored at $BACKUP_DIR/$TS"
 fi
 
-# --- Deploy -------------------------------------------------------------------
 log "Pulling images..."
 docker-compose -f "$COMPOSE_FILE" pull
 
@@ -151,7 +144,6 @@ docker-compose -f "$COMPOSE_FILE" up -d app proxy
 log "Waiting 20s for services..."
 sleep 20
 
-# Run migrations/collectstatic via one-off container
 log "Running migrations (one-off)..."
 docker-compose -f "$COMPOSE_FILE" run --rm app python manage.py migrate --noinput || warn "migrate failed"
 
@@ -175,7 +167,6 @@ docker-compose -f "$COMPOSE_FILE" ps
 
 log "Deployment complete. App at: http://${PUBIP:-your-server-ip}"
 
-# --- Rollback helper (manual call) -------------------------------------------
 rollback() {
   log "Rolling back..."
   LATEST="$(ls -t "$BACKUP_DIR" | head -n1)"
@@ -185,9 +176,8 @@ rollback() {
   cp "$BACKUP_DIR/$LATEST/.env" "$ENV_FILE" || true
   docker-compose -f "$COMPOSE_FILE" up -d
   if [ -f "$BACKUP_DIR/$LATEST/db.sqlite3" ]; then
-    log "Restoring SQLite DB..."
     CID="$(docker-compose -f "$COMPOSE_FILE" ps -q app)"
-    docker cp "$BACKUP_DIR/$LATEST/db.sqlite3" "$CID:/data/db.sqlite3" || true
+    docker cp "$BACKUP_DIR/$LATEST/db.sqlite3" "$CID:/app/db.sqlite3" || true
   fi
   log "Rollback done."
 }
