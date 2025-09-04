@@ -25,6 +25,7 @@ from drf_spectacular.views import (
     SpectacularSwaggerView,
 )
 
+
 def health_check(request):
     """Health check endpoint for deployment monitoring"""
     return JsonResponse({
@@ -32,6 +33,7 @@ def health_check(request):
         "service": "fieldflow",
         "version": "1.0.0"
     })
+
 
 urlpatterns = [
     path("admin/", admin.site.urls),
