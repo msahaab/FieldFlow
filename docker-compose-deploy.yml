@@ -22,7 +22,8 @@ services:
     ports:
       - 80:8000
     volumes:
-      - static-data:/vol/static
+      - static-data:/vol/web/static
+      - media-data:/vol/web/media
 
 volumes:
   static-data:
