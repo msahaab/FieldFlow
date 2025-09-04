@@ -6,12 +6,47 @@ log(){ echo -e "${GREEN}[$(date +'%F %T')] $*${NC}"; }
 err(){ echo -e "${RED}[$(date +'%F %T')] ERROR: $*${NC}"; exit 1; }
 warn(){ echo -e "${YELLOW}[$(date +'%F %T')] WARNING: $*${NC}"; }
 
+ensure_free_space() {
+  DOCKER_ROOT="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)"
+  FREE_MB="$(df -Pm "$DOCKER_ROOT" 2>/dev/null | awk 'NR==2{print $4}')"
+  THRESH_MB="${1:-4096}"
+  if [ "${FREE_MB:-0}" -ge "$THRESH_MB" ]; then
+    log "Disk OK at $DOCKER_ROOT: ${FREE_MB}MB free"
+    return 0
+  fi
+  warn "Low space on $DOCKER_ROOT: ${FREE_MB:-0}MB free; running cleanup…"
+  docker system prune -af --volumes || true
+  docker builder prune -af || true
+  docker image prune -af || true
+  docker volume ls -qf dangling=true | xargs -r docker volume rm || true
+  if [ -d "$DOCKER_ROOT/containers" ]; then
+    find "$DOCKER_ROOT/containers" -name "*-json.log" -type f -size +50M -exec truncate -s 0 {} \; 2>/dev/null || true
+  fi
+  if command -v journalctl >/dev/null 2>&1; then
+    sudo journalctl --vacuum-size=100M || true
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get clean || true
+  elif command -v yum >/dev/null 2>&1; then
+    sudo yum clean all || true
+  fi
+  BACKUP_KEEP="${BACKUP_KEEP:-3}"
+  if [ -d "$BACKUP_DIR" ]; then
+    ls -1dt "$BACKUP_DIR"/*/ 2>/dev/null | tail -n +$((BACKUP_KEEP+1)) | xargs -r rm -rf || true
+  fi
+  FREE_MB="$(df -Pm "$DOCKER_ROOT" 2>/dev/null | awk 'NR==2{print $4}')"
+  if [ "${FREE_MB:-0}" -lt "$THRESH_MB" ]; then
+    err "Not enough disk after cleanup (${FREE_MB:-0}MB free at $DOCKER_ROOT). Increase EBS size or free space manually, then rerun."
+  fi
+  log "Cleanup done: ${FREE_MB}MB free at $DOCKER_ROOT"
+}
+
 APP_NAME="fieldflow"
 DEPLOY_DIR="/opt/fieldflow"
 BACKUP_DIR="/opt/fieldflow-backups"
 COMPOSE_FILE="$DEPLOY_DIR/docker-compose-deploy.yml"
 ENV_FILE="$DEPLOY_DIR/.env"
-DB_HOST_DIR="$DEPLOY_DIR/db"   # host path persisted on EC2
+DB_HOST_DIR="$DEPLOY_DIR/db"
 DB_FILE="$DB_HOST_DIR/db.sqlite3"
 
 mkdir -p "$DEPLOY_DIR" "$BACKUP_DIR"
@@ -23,7 +58,6 @@ log "Starting deployment of $APP_NAME ..."
 : "${ECR_REPOSITORY:?ECR_REPOSITORY not set}"
 : "${IMAGE_TAG:?IMAGE_TAG not set}"
 
-# --- prerequisites -----------------------------------------------------------
 if ! command -v aws >/dev/null 2>&1; then
   if command -v yum >/dev/null 2>&1; then
     sudo yum -y install awscli
@@ -49,25 +83,20 @@ if ! command -v docker-compose >/dev/null 2>&1; then
   sudo chmod +x /usr/local/bin/docker-compose
 fi
 
-# --- ECR login ---------------------------------------------------------------
 log "Logging in to Amazon ECR..."
 if ! aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "$ECR_REGISTRY"; then
   err "ECR login failed"
 fi
 
-# --- discover public IP with safe fallback -----------------------------------
 TOKEN="$(curl -sS -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' || true)"
 PUBIP="$(curl -sS -H "X-aws-ec2-metadata-token: ${TOKEN}" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo '')"
 if [ -z "${PUBIP}" ]; then
-  # Final fallback placeholder if IMDS is unavailable (e.g., running outside EC2 or blocked)
   PUBIP="your-server-ip"
 fi
 
-# --- ensure host DB path exists ----------------------------------------------
 mkdir -p "$DB_HOST_DIR"
 [ -f "$DB_FILE" ] || touch "$DB_FILE"
 
-# --- ensure .env exists and contains DB vars ---------------------------------
 if [ ! -f "$ENV_FILE" ]; then
   if [ -f "$DEPLOY_DIR/.env.sample" ]; then
     cp "$DEPLOY_DIR/.env.sample" "$ENV_FILE"
@@ -76,27 +105,23 @@ if [ ! -f "$ENV_FILE" ]; then
 DJANGO_SECRET_KEY=CHANGE_ME
 DJANGO_DEBUG=0
 DATABASE_URL=sqlite:////data/db.sqlite3
-# Optional for projects that don't parse DATABASE_URL:
 DATABASE_PATH=/data/db.sqlite3
 EOF
   fi
 fi
 
-# Always ensure DB settings are correct
 if grep -qE '^DATABASE_URL=' "$ENV_FILE"; then
   sed -i "s#^DATABASE_URL=.*#DATABASE_URL=sqlite:////data/db.sqlite3#" "$ENV_FILE"
 else
   echo "DATABASE_URL=sqlite:////data/db.sqlite3" >> "$ENV_FILE"
 fi
 
-# Optional helper for settings that use DATABASE_PATH instead of DATABASE_URL
 if grep -qE '^DATABASE_PATH=' "$ENV_FILE"; then
   sed -i "s#^DATABASE_PATH=.*#DATABASE_PATH=/data/db.sqlite3#" "$ENV_FILE"
 else
   echo "DATABASE_PATH=/data/db.sqlite3" >> "$ENV_FILE"
 fi
 
-# Allowed hosts include public IP by default
 HOSTS="localhost,127.0.0.1,${PUBIP}"
 if grep -qE '^DJANGO_ALLOWED_HOSTS=' "$ENV_FILE"; then
   sed -i "s/^DJANGO_ALLOWED_HOSTS=.*/DJANGO_ALLOWED_HOSTS=${HOSTS}/" "$ENV_FILE"
@@ -104,7 +129,6 @@ else
   echo "DJANGO_ALLOWED_HOSTS=${HOSTS}" >> "$ENV_FILE"
 fi
 
-# --- write compose file -------------------------------------------------------
 log "Writing $COMPOSE_FILE ..."
 cat > "$COMPOSE_FILE" <<'EOF'
 services:
@@ -143,7 +167,6 @@ networks:
     driver: bridge
 EOF
 
-# --- backup if stack is already up -------------------------------------------
 if docker-compose -f "$COMPOSE_FILE" ps 2>/dev/null | grep -q "Up"; then
   TS="$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$BACKUP_DIR/$TS"
@@ -156,7 +179,8 @@ if docker-compose -f "$COMPOSE_FILE" ps 2>/dev/null | grep -q "Up"; then
   log "Backup stored at $BACKUP_DIR/$TS"
 fi
 
-# --- deploy -------------------------------------------------------------------
+ensure_free_space 4096
+
 log "Pulling images..."
 docker-compose -f "$COMPOSE_FILE" pull
 
@@ -166,7 +190,6 @@ docker-compose -f "$COMPOSE_FILE" down --remove-orphans || true
 log "Starting app and proxy..."
 docker-compose -f "$COMPOSE_FILE" up -d --remove-orphans app proxy
 
-# Fix ownership/perms on host before running migrations
 log "Ensuring SQLite ownership and perms..."
 APP_UID="$(docker run --rm "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" sh -c 'id -u' 2>/dev/null || echo 1000)"
 APP_GID="$(docker run --rm "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" sh -c 'id -g' 2>/dev/null || echo 1000)"
@@ -202,14 +225,12 @@ docker image prune -f || true
 log "Containers:"
 docker-compose -f "$COMPOSE_FILE" ps
 
-# Final success line with guaranteed non-empty URL
 if [ -n "$PUBIP" ] && [ "$PUBIP" != "your-server-ip" ]; then
   log "Deployment complete. App at: http://${PUBIP}"
 else
   log "Deployment complete. App at: http://3.87.76.21"
 fi
 
-# --- rollback helper ----------------------------------------------------------
 rollback() {
   log "Rolling back..."
   LATEST="$(ls -t "$BACKUP_DIR" | head -n1)"
