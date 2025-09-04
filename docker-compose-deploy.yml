@@ -7,9 +7,11 @@ services:
     restart: always
     volumes:
       - static-data:/vol/web
+      - dbdata:/data
     environment:
       - SECRET_KEY=${DJANGO_SECRET_KEY}
       - ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS}
+      - DATABASE_PATH=/data/db.sqlite3
 
   proxy:
     build:
@@ -24,3 +26,4 @@ services:
 
 volumes:
   static-data:
+  dbdata:
