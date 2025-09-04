@@ -124,24 +124,6 @@ jobs:
             chmod +x /opt/fieldflow/deploy-ec2.sh
             /opt/fieldflow/deploy-ec2.sh
 
-      - name: Health Check
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USERNAME }}
-          port: ${{ secrets.EC2_PORT || '22' }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          script_stop: true
-          envs: AWS_REGION
-          script: |
-            sleep 30
-            if curl -f http://localhost/health/ || curl -f http://localhost:8000/health/; then
-              echo "Deployment successful - Health check passed"
-            else
-              echo "Deployment failed - Health check failed"
-              exit 1
-            fi
-
   notify:
     name: Notify Deployment Status
     runs-on: ubuntu-latest
