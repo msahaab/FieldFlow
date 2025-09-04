@@ -99,20 +99,14 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Decode SSH key
-        run: |
-          umask 077
-          echo "${{ secrets.EC2_SSH_KEY_B64 }}" | base64 -d > key.pem
-          sed -i 's/\r$//' key.pem
-          chmod 644 key.pem
-
       - name: Deploy to EC2
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
-          port: ${{ secrets.EC2_PORT || 22 }}
-          key_path: key.pem
+          port: ${{ secrets.EC2_PORT || '22' }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
           script: |
             set -e
             export AWS_REGION=${{ env.AWS_REGION }}
@@ -131,8 +125,9 @@ jobs:
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
-          port: ${{ secrets.EC2_PORT || 22 }}
-          key_path: key.pem
+          port: ${{ secrets.EC2_PORT || '22' }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
           script: |
             sleep 30
             if curl -f http://localhost/health/ || curl -f http://localhost:8000/health/; then
