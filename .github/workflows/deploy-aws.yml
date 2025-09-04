@@ -1,156 +1,155 @@
-name: CI/CD to ECR & EC2
+name: Deploy to AWS EC2
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options: [production, staging]
 
 env:
   AWS_REGION: us-east-1
-  ECR_REPOSITORY: ${{ github.event.repository.name }}
-  IMAGE_TAG: ${{ github.sha }}
+  ECR_REPOSITORY: fieldflow-app
+
+permissions:
+  contents: read
 
 jobs:
-  lint:
-    name: Lint (flake8 + black --check)
+  test:
+    name: Test and Lint
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Run tests
+        run: docker compose run --rm app sh -c "python manage.py test"
+      - name: Lint
+        run: docker compose run --rm app sh -c "flake8"
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements*.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install tools
-        run: |
-          python -m pip install --upgrade pip
-          pip install flake8 black
-          # If you have project deps:
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: Run flake8
-        run: flake8 .
-
-      - name: Run black check
-        run: black --check .
-
-  build_and_push:
-    name: Build & Push Docker to ECR
+  build-and-push:
+    name: Build and Push to ECR
     runs-on: ubuntu-latest
-    needs: lint
-    env:
-      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+    needs: test
+    environment: deployment
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (temporary creds with session token)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Who am I
+        run: aws sts get-caller-identity
 
       - name: Login to Amazon ECR
-        id: ecr-login
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image
+      - name: Build, tag, and push APP image
         env:
-          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          IMAGE_URI=${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}
-          LATEST_URI=${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+          docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG .
+          docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest .
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}:latest
 
-          echo "Building ${IMAGE_URI}"
-          docker build -t "${IMAGE_URI}" -t "${LATEST_URI}" .
-
-          echo "Pushing ${IMAGE_URI} and ${LATEST_URI}"
-          docker push "${IMAGE_URI}"
-          docker push "${LATEST_URI}"
-
-      - name: Expose image URI for next job
-        id: meta
+      - name: Build, tag, and push PROXY image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          echo "image_uri=${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}" >> $GITHUB_OUTPUT
-
-    outputs:
-      image_uri: ${{ steps.meta.outputs.image_uri }}
+          docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}-proxy:$IMAGE_TAG ./proxy
+          docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}-proxy:latest ./proxy
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}-proxy:$IMAGE_TAG
+          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY }}-proxy:latest
 
   deploy:
-    name: Deploy on EC2 (pull from ECR & restart container)
+    name: Deploy to EC2
     runs-on: ubuntu-latest
-    needs: build_and_push
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
     steps:
-      - name: Configure AWS credentials
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (temporary creds with session token)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: ${{ env.AWS_REGION }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
 
-      - name: Deploy over SSH
-        uses: appleboy/ssh-action@v1.2.0
+      - name: Who am I
+        run: aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_SESSION_TOKEN:     ${{ secrets.AWS_SESSION_TOKEN }}
+          AWS_REGION:            ${{ env.AWS_REGION }}
+          AWS_DEFAULT_REGION:    ${{ env.AWS_REGION }}
+          ECR_REGISTRY:          ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY:        ${{ env.ECR_REPOSITORY }}
+          IMAGE_TAG:             ${{ github.sha }}
+          ENVIRONMENT:           ${{ github.event.inputs.environment || 'production' }}
         with:
           host: ${{ secrets.EC2_HOST }}
-          port: ${{ secrets.EC2_PORT }}
           username: ${{ secrets.EC2_USERNAME }}
+          port: ${{ secrets.EC2_PORT || '22' }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN,AWS_REGION,IMAGE_URI
+          envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN,AWS_REGION,AWS_DEFAULT_REGION,ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ENVIRONMENT
           script_stop: true
           script: |
             set -euo pipefail
+            echo "[Deploy] Login to ECR on EC2"
+            aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-            # Parameters from workflow
-            IMAGE_URI="${{ needs.build_and_push.outputs.image_uri }}"
-            CONTAINER_NAME="app"
+            mkdir -p /opt/fieldflow
+            curl -fsSL -o /opt/fieldflow/deploy-ec2.sh \
+              https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/scripts/deploy-ec2.sh
+            chmod +x /opt/fieldflow/deploy-ec2.sh
+            /opt/fieldflow/deploy-ec2.sh
 
-            echo "Using image: ${IMAGE_URI}"
-
-            # Ensure dependencies exist on EC2
-            if ! command -v docker >/dev/null 2>&1; then
-              echo "Docker not found on EC2. Please install Docker first."
-              exit 1
-            fi
-
-            # Login to ECR (requires AWS CLI & credentials/instance role)
-            if command -v aws >/dev/null 2>&1; then
-              aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "$(echo "${IMAGE_URI}" | cut -d/ -f1)"
+      - name: Health Check
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          AWS_REGION: ${{ env.AWS_REGION }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          port: ${{ secrets.EC2_PORT || '22' }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: AWS_REGION
+          script_stop: true
+          script: |
+            sleep 30
+            if curl -f http://localhost/health/ || curl -f http://localhost:8000/health/; then
+              echo "Deployment successful - Health check passed"
             else
-              echo "AWS CLI not found on EC2. Please install awscli or attach an instance role with ECR permissions and AWS CLI."
+              echo "Deployment failed - Health check failed"
               exit 1
             fi
 
-            # Pull latest image
-            docker pull "${IMAGE_URI}"
 
-            # Stop and remove previous container if running
-            if docker ps -a --format '{{.Names}}' | grep -Eq "^${CONTAINER_NAME}\$"; then
-              echo "Stopping existing container..."
-              docker stop "${CONTAINER_NAME}" || true
-              docker rm "${CONTAINER_NAME}" || true
-            fi
-
-            # Run container (customize ports/env as needed)
-            docker run -d --name "${CONTAINER_NAME}" \
-              -p 80:8000 \
-              --restart unless-stopped \
-              "${IMAGE_URI}"
-
-            echo "Deployment complete."
   notify:
     name: Notify Deployment Status
     runs-on: ubuntu-latest
