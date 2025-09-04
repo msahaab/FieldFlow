@@ -107,17 +107,22 @@ jobs:
           port: ${{ secrets.EC2_PORT || '22' }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script_stop: true
+          envs: AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_SESSION_TOKEN,AWS_REGION,ECR_REGISTRY,ECR_REPOSITORY,IMAGE_TAG,ENVIRONMENT
           script: |
             set -e
-            export AWS_REGION=${{ env.AWS_REGION }}
-            export ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
-            export ECR_REPOSITORY=${{ env.ECR_REPOSITORY }}
-            export IMAGE_TAG=${{ github.sha }}
-            export ENVIRONMENT=${{ github.event.inputs.environment || 'production' }}
+            # Use values passed via envs:
+            export AWS_REGION="${AWS_REGION}"
+            export ECR_REGISTRY="${ECR_REGISTRY}"
+            export ECR_REPOSITORY="${ECR_REPOSITORY}"
+            export IMAGE_TAG="${IMAGE_TAG}"
+            export ENVIRONMENT="${ENVIRONMENT:-${{ github.event.inputs.environment || 'production' }}}"
+
             mkdir -p /opt/fieldflow
+            # Pin to the current commit SHA for reproducibility
             curl -fsSL -o /opt/fieldflow/deploy-ec2.sh \
-              https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/scripts/deploy-ec2.sh
+              https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/scripts/deploy-ec2.sh
             chmod +x /opt/fieldflow/deploy-ec2.sh
+
             /opt/fieldflow/deploy-ec2.sh
 
       - name: Health Check
@@ -128,6 +133,7 @@ jobs:
           port: ${{ secrets.EC2_PORT || '22' }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script_stop: true
+          envs: AWS_REGION
           script: |
             sleep 30
             if curl -f http://localhost/health/ || curl -f http://localhost:8000/health/; then
