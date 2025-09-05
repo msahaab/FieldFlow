@@ -58,6 +58,7 @@ log "Starting deployment of $APP_NAME ..."
 : "${ECR_REPOSITORY:?ECR_REPOSITORY not set}"
 : "${IMAGE_TAG:?IMAGE_TAG not set}"
 
+# --- Tooling bootstrap ---
 if ! command -v aws >/dev/null 2>&1; then
   if command -v yum >/dev/null 2>&1; then
     sudo yum -y install awscli
@@ -88,6 +89,7 @@ if ! aws ecr get-login-password --region "${AWS_REGION}" | docker login --userna
   err "ECR login failed"
 fi
 
+# --- Instance public IP for allowed hosts ---
 TOKEN="$(curl -sS -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' || true)"
 PUBIP="$(curl -sS -H "X-aws-ec2-metadata-token: ${TOKEN}" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || echo '')"
 if [ -z "${PUBIP}" ]; then
@@ -97,6 +99,7 @@ fi
 mkdir -p "$DB_HOST_DIR"
 [ -f "$DB_FILE" ] || touch "$DB_FILE"
 
+# --- .env management ---
 if [ ! -f "$ENV_FILE" ]; then
   if [ -f "$DEPLOY_DIR/.env.sample" ]; then
     cp "$DEPLOY_DIR/.env.sample" "$ENV_FILE"
@@ -106,10 +109,12 @@ DJANGO_SECRET_KEY=CHANGE_ME
 DJANGO_DEBUG=0
 DATABASE_URL=sqlite:////data/db.sqlite3
 DATABASE_PATH=/data/db.sqlite3
+DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1,${PUBIP}
 EOF
   fi
 fi
 
+# enforce sqlite settings & allowed hosts
 if grep -qE '^DATABASE_URL=' "$ENV_FILE"; then
   sed -i "s#^DATABASE_URL=.*#DATABASE_URL=sqlite:////data/db.sqlite3#" "$ENV_FILE"
 else
@@ -129,6 +134,7 @@ else
   echo "DJANGO_ALLOWED_HOSTS=${HOSTS}" >> "$ENV_FILE"
 fi
 
+# --- Write deploy compose with correct env mapping ---
 log "Writing $COMPOSE_FILE ..."
 cat > "$COMPOSE_FILE" <<'EOF'
 services:
@@ -139,6 +145,8 @@ services:
       - /opt/fieldflow/.env
     environment:
       - SECRET_KEY=${DJANGO_SECRET_KEY}
+      - ALLOWED_HOSTS=${DJANGO_ALLOWED_HOSTS}
+      - DATABASE_PATH=/data/db.sqlite3
       - DEBUG=0
     volumes:
       - /opt/fieldflow/db:/data
@@ -154,8 +162,8 @@ services:
       - "80:8000"
       - "443:8443"
     volumes:
-      - static-data:/vol/static
-      - media-data:/vol/media
+      - static-data:/vol/web/static
+      - media-data:/vol/web/media
     networks: [app-network]
 
 volumes:
@@ -167,6 +175,7 @@ networks:
     driver: bridge
 EOF
 
+# --- Back up current state if already running ---
 if docker-compose -f "$COMPOSE_FILE" ps 2>/dev/null | grep -q "Up"; then
   TS="$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$BACKUP_DIR/$TS"
@@ -190,6 +199,14 @@ docker-compose -f "$COMPOSE_FILE" down --remove-orphans || true
 log "Starting app and proxy..."
 docker-compose -f "$COMPOSE_FILE" up -d --remove-orphans app proxy
 
+# --- Health check: fail fast if app didn't stay up ---
+sleep 5
+if ! docker-compose -f "$COMPOSE_FILE" ps | awk '/app/ {print $4 $5 $6}' | grep -q 'Up'; then
+  warn "app did not report 'Up' immediately; showing recent logs:"
+  docker-compose -f "$COMPOSE_FILE" logs --tail=200 app || true
+fi
+
+# --- Ensure SQLite file ownership & perms ---
 log "Ensuring SQLite ownership and perms..."
 APP_UID="$(docker run --rm "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" sh -c 'id -u' 2>/dev/null || echo 1000)"
 APP_GID="$(docker run --rm "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" sh -c 'id -g' 2>/dev/null || echo 1000)"
